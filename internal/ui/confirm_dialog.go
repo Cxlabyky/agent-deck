@@ -14,6 +14,7 @@ type ConfirmType int
 const (
 	ConfirmDeleteSession ConfirmType = iota
 	ConfirmDeleteGroup
+	ConfirmDeleteDecision
 )
 
 // ConfirmDialog handles confirmation for destructive actions
@@ -45,6 +46,14 @@ func (c *ConfirmDialog) ShowDeleteGroup(groupPath, groupName string) {
 	c.confirmType = ConfirmDeleteGroup
 	c.targetID = groupPath
 	c.targetName = groupName
+}
+
+// ShowDeleteDecision shows confirmation for decision deletion
+func (c *ConfirmDialog) ShowDeleteDecision(decisionID, decisionText string) {
+	c.visible = true
+	c.confirmType = ConfirmDeleteDecision
+	c.targetID = decisionID
+	c.targetName = decisionText
 }
 
 // Hide hides the dialog
@@ -100,6 +109,15 @@ func (c *ConfirmDialog) View() string {
 		title = "⚠️  Delete Group?"
 		warning = fmt.Sprintf("This will delete the group:\n\n  \"%s\"", c.targetName)
 		details = "• All sessions will be MOVED to 'default' group\n• Sessions will NOT be killed\n• The group structure will be lost"
+
+	case ConfirmDeleteDecision:
+		title = "⚠️  Delete Decision?"
+		decisionPreview := c.targetName
+		if len(decisionPreview) > 50 {
+			decisionPreview = decisionPreview[:47] + "..."
+		}
+		warning = fmt.Sprintf("This will PERMANENTLY delete the decision:\n\n  \"%s\"", decisionPreview)
+		details = "• The decision record will be removed\n• This cannot be undone\n• Consider archiving instead (press 'a')"
 	}
 
 	// Styles

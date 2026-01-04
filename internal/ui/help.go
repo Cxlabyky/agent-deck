@@ -108,6 +108,18 @@ func (h *HelpOverlay) View() string {
 			},
 		},
 		{
+			title: "LEDGER",
+			items: [][2]string{
+				{"Ctrl+D", "Log decision"},
+				{"Shift+D", "Toggle decisions view"},
+				{"a", "Archive decision"},
+				{"o", "Mark overridden"},
+				{"A", "Reactivate decision"},
+				{"c", "Copy to clipboard"},
+				{"d", "Delete decision"},
+			},
+		},
+		{
 			title: "OTHER",
 			items: [][2]string{
 				{"Ctrl+R", "Reload from disk"},

@@ -15,6 +15,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/asheshgoplani/agent-deck/internal/ledger"
 	"github.com/asheshgoplani/agent-deck/internal/session"
 	"github.com/asheshgoplani/agent-deck/internal/ui"
 	"github.com/asheshgoplani/agent-deck/internal/update"
@@ -241,11 +242,16 @@ func main() {
 	}
 	defer releaseLock(profile)
 
-	// Set up signal handling for graceful lock cleanup
+	// Initialize ledger manager for decision tracking
+	ledgerMgr := ledger.GetManager()
+	defer ledgerMgr.CloseAll()
+
+	// Set up signal handling for graceful cleanup
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
 		<-sigChan
+		ledgerMgr.CloseAll()
 		releaseLock(profile)
 		os.Exit(0)
 	}()

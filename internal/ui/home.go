@@ -13,10 +13,13 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/atotto/clipboard"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/mattn/go-runewidth"
 
+	"github.com/asheshgoplani/agent-deck/internal/database"
+	"github.com/asheshgoplani/agent-deck/internal/ledger"
 	"github.com/asheshgoplani/agent-deck/internal/session"
 	"github.com/asheshgoplani/agent-deck/internal/tmux"
 	"github.com/asheshgoplani/agent-deck/internal/update"
@@ -106,8 +109,13 @@ type Home struct {
 	groupDialog   *GroupDialog   // For creating/renaming groups
 	forkDialog    *ForkDialog    // For forking sessions
 	confirmDialog *ConfirmDialog // For confirming destructive actions
-	helpOverlay   *HelpOverlay   // For showing keyboard shortcuts
-	mcpDialog     *MCPDialog     // For managing MCPs
+	helpOverlay    *HelpOverlay    // For showing keyboard shortcuts
+	mcpDialog      *MCPDialog      // For managing MCPs
+	decisionDialog *DecisionDialog // For logging decisions (Ctrl+D)
+	decisionPanel  *DecisionListPanel  // For viewing decisions list
+
+	// View mode (toggle between sessions and decisions)
+	viewMode ViewMode
 
 	// State
 	cursor        int            // Selected item index in flatItems
@@ -191,6 +199,21 @@ type loadSessionsMsg struct {
 	poolError    error        // Pool initialization error
 }
 
+type loadDecisionsMsg struct {
+	decisions []*database.Decision
+	err       error
+}
+
+type decisionStatusMsg struct {
+	action string // "archive", "override", "reactivate", "delete"
+	err    error
+}
+
+type clipboardCopyMsg struct {
+	success bool
+	err     error
+}
+
 type sessionCreatedMsg struct {
 	instance *session.Instance
 	err      error
@@ -264,6 +287,9 @@ func NewHomeWithProfile(profile string) *Home {
 		confirmDialog:     NewConfirmDialog(),
 		helpOverlay:       NewHelpOverlay(),
 		mcpDialog:         NewMCPDialog(),
+		decisionDialog:    NewDecisionDialog(),
+		decisionPanel:     NewDecisionListPanel(),
+		viewMode:          ViewModeSessions,
 		cursor:            0,
 		initialLoading:    true, // Show splash until sessions load
 		ctx:               ctx,
@@ -1073,6 +1099,30 @@ func (h *Home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return h, nil
 
+	case loadDecisionsMsg:
+		if msg.err != nil {
+			h.setError(msg.err)
+		} else {
+			h.decisionPanel.SetDecisions(msg.decisions)
+		}
+		return h, nil
+
+	case decisionStatusMsg:
+		if msg.err != nil {
+			h.setError(msg.err)
+		} else {
+			// Reload decisions to reflect the change
+			return h, h.loadDecisions()
+		}
+		return h, nil
+
+	case clipboardCopyMsg:
+		if msg.err != nil {
+			h.setError(msg.err)
+		}
+		// Success is silent - no need for feedback
+		return h, nil
+
 	case sessionCreatedMsg:
 		// CRITICAL FIX: Skip processing during reload to prevent state corruption
 		// If we modify h.instances during reload, the loadSessionsMsg will overwrite
@@ -1465,6 +1515,9 @@ func (h *Home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if h.mcpDialog.IsVisible() {
 			return h.handleMCPDialogKey(msg)
 		}
+		if h.decisionDialog.IsVisible() {
+			return h.handleDecisionDialogKey(msg)
+		}
 
 		// Main view keys
 		return h.handleMainKey(msg)
@@ -1702,6 +1755,10 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return h, tea.Quit
 
 	case "up", "k":
+		if h.viewMode == ViewModeDecisions {
+			h.decisionPanel.MoveUp()
+			return h, nil
+		}
 		if h.cursor > 0 {
 			h.cursor--
 			h.syncViewport()
@@ -1721,6 +1778,10 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return h, nil
 
 	case "down", "j":
+		if h.viewMode == ViewModeDecisions {
+			h.decisionPanel.MoveDown()
+			return h, nil
+		}
 		if h.cursor < len(h.flatItems)-1 {
 			h.cursor++
 			h.syncViewport()
@@ -1740,6 +1801,10 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return h, nil
 
 	case "enter":
+		if h.viewMode == ViewModeDecisions {
+			// Show decision detail in preview pane (will be implemented in Phase 2.3)
+			return h, nil
+		}
 		if h.cursor < len(h.flatItems) {
 			item := h.flatItems[h.cursor]
 			if item.Type == session.ItemTypeSession && item.Session != nil {
@@ -1914,6 +1979,23 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		h.helpOverlay.Show()
 		return h, nil
 
+	case "ctrl+d":
+		// Open decision logging dialog
+		h.decisionDialog.SetSize(h.width, h.height)
+		h.decisionDialog.Show()
+		return h, nil
+
+	case "D", "shift+d":
+		// Toggle between sessions and decisions views
+		if h.viewMode == ViewModeSessions {
+			h.viewMode = ViewModeDecisions
+			// Load decisions for current project
+			return h, h.loadDecisions()
+		} else {
+			h.viewMode = ViewModeSessions
+		}
+		return h, nil
+
 	case "n":
 		// Collect unique project paths sorted by most recently accessed
 		type pathInfo struct {
@@ -1987,6 +2069,13 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return h, nil
 
 	case "d":
+		// Handle decision deletion in decisions view mode
+		if h.viewMode == ViewModeDecisions {
+			if selected := h.decisionPanel.Selected(); selected != nil {
+				h.confirmDialog.ShowDeleteDecision(selected.ID, selected.Decision)
+			}
+			return h, nil
+		}
 		// Show confirmation dialog before deletion (prevents accidental deletion)
 		if h.cursor < len(h.flatItems) {
 			item := h.flatItems[h.cursor]
@@ -1994,6 +2083,42 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				h.confirmDialog.ShowDeleteSession(item.Session.ID, item.Session.Title)
 			} else if item.Type == session.ItemTypeGroup && item.Path != session.DefaultGroupPath {
 				h.confirmDialog.ShowDeleteGroup(item.Path, item.Group.Name)
+			}
+		}
+		return h, nil
+
+	case "a":
+		// Archive decision (decisions view only)
+		if h.viewMode == ViewModeDecisions {
+			if selected := h.decisionPanel.Selected(); selected != nil {
+				return h, h.archiveDecision(selected.ID)
+			}
+		}
+		return h, nil
+
+	case "o":
+		// Mark decision as overridden (decisions view only)
+		if h.viewMode == ViewModeDecisions {
+			if selected := h.decisionPanel.Selected(); selected != nil {
+				return h, h.overrideDecision(selected.ID)
+			}
+		}
+		return h, nil
+
+	case "A":
+		// Reactivate decision (decisions view only)
+		if h.viewMode == ViewModeDecisions {
+			if selected := h.decisionPanel.Selected(); selected != nil {
+				return h, h.reactivateDecision(selected.ID)
+			}
+		}
+		return h, nil
+
+	case "c":
+		// Copy decision to clipboard (decisions view only)
+		if h.viewMode == ViewModeDecisions {
+			if selected := h.decisionPanel.Selected(); selected != nil {
+				return h, h.copyDecisionToClipboard(selected)
 			}
 		}
 		return h, nil
@@ -2122,6 +2247,10 @@ func (h *Home) handleConfirmDialogKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			h.instancesMu.Unlock()
 			h.rebuildFlatItems()
 			h.saveInstances()
+		case ConfirmDeleteDecision:
+			decisionID := h.confirmDialog.GetTargetID()
+			h.confirmDialog.Hide()
+			return h, h.deleteDecision(decisionID)
 		}
 		h.confirmDialog.Hide()
 		return h, nil
@@ -2189,6 +2318,254 @@ func (h *Home) handleMCPDialogKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		h.mcpDialog.Update(msg)
 		return h, nil
 	}
+}
+
+// handleDecisionDialogKey handles keys when decision dialog is visible
+func (h *Home) handleDecisionDialogKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "ctrl+s":
+		// Validate before saving
+		if validationErr := h.decisionDialog.Validate(); validationErr != "" {
+			h.decisionDialog.SetError(validationErr)
+			return h, nil
+		}
+
+		// Get values from dialog
+		category, decision, rationale := h.decisionDialog.GetValues()
+
+		// Get current project path (from selected session or current directory)
+		projectPath := h.getCurrentProjectPath()
+		if projectPath == "" {
+			h.decisionDialog.SetError("No project path found")
+			return h, nil
+		}
+
+		// Get current session ID for linking
+		var sessionID string
+		if selected := h.getSelectedSession(); selected != nil {
+			sessionID = selected.ID
+		}
+
+		// Save decision to database
+		if err := h.saveDecision(projectPath, category, decision, rationale, sessionID); err != nil {
+			h.decisionDialog.SetError(fmt.Sprintf("Failed to save: %v", err))
+			return h, nil
+		}
+
+		h.decisionDialog.Hide()
+		h.setSuccess("Decision logged successfully")
+		return h, nil
+
+	case "esc":
+		h.decisionDialog.Hide()
+		return h, nil
+
+	default:
+		h.decisionDialog.Update(msg)
+		return h, nil
+	}
+}
+
+// getCurrentProjectPath returns the project path from the selected session or current directory
+func (h *Home) getCurrentProjectPath() string {
+	// First try to get from selected session
+	if selected := h.getSelectedSession(); selected != nil && selected.ProjectPath != "" {
+		return selected.ProjectPath
+	}
+
+	// Fallback to current working directory
+	cwd, err := os.Getwd()
+	if err != nil {
+		return ""
+	}
+	return cwd
+}
+
+// saveDecision saves a decision to the ledger database
+func (h *Home) saveDecision(projectPath, category, decisionText, rationale, sessionID string) error {
+	// Get or create database for this project
+	mgr := ledger.GetManager()
+	db, err := mgr.GetDB(projectPath)
+	if err != nil {
+		return fmt.Errorf("failed to get ledger database: %w", err)
+	}
+
+	// Create the decision record
+	decision := &database.Decision{
+		Category:  category,
+		Decision:  decisionText,
+		Rationale: rationale,
+		SessionID: sessionID, // Link to the session it was created from
+	}
+
+	if err := db.CreateDecision(decision); err != nil {
+		return fmt.Errorf("failed to save decision: %w", err)
+	}
+
+	log.Printf("[LEDGER] Decision saved - ID: %s, Category: %s, Project: %s, Session: %s",
+		decision.ID, category, projectPath, sessionID)
+	return nil
+}
+
+// setSuccess sets a success message (temporary - will be improved)
+func (h *Home) setSuccess(msg string) {
+	// For now, just clear any error - we'll add proper success messages later
+	h.clearError()
+}
+
+// loadDecisions returns a command to load decisions for the current project
+func (h *Home) loadDecisions() tea.Cmd {
+	projectPath := h.getCurrentProjectPath()
+	if projectPath == "" {
+		return func() tea.Msg {
+			return loadDecisionsMsg{err: fmt.Errorf("no project selected")}
+		}
+	}
+
+	return func() tea.Msg {
+		mgr := ledger.GetManager()
+		db, err := mgr.GetDB(projectPath)
+		if err != nil {
+			return loadDecisionsMsg{err: fmt.Errorf("failed to get database: %w", err)}
+		}
+
+		// Load all decisions (active, archived, overridden)
+		decisions, err := db.ListDecisions(database.DecisionFilter{})
+		if err != nil {
+			return loadDecisionsMsg{err: fmt.Errorf("failed to load decisions: %w", err)}
+		}
+
+		return loadDecisionsMsg{decisions: decisions}
+	}
+}
+
+// archiveDecision archives a decision
+func (h *Home) archiveDecision(decisionID string) tea.Cmd {
+	projectPath := h.getCurrentProjectPath()
+	return func() tea.Msg {
+		mgr := ledger.GetManager()
+		db, err := mgr.GetDB(projectPath)
+		if err != nil {
+			return decisionStatusMsg{action: "archive", err: err}
+		}
+		if err := db.ArchiveDecision(decisionID); err != nil {
+			return decisionStatusMsg{action: "archive", err: err}
+		}
+		return decisionStatusMsg{action: "archive"}
+	}
+}
+
+// overrideDecision marks a decision as overridden
+func (h *Home) overrideDecision(decisionID string) tea.Cmd {
+	projectPath := h.getCurrentProjectPath()
+	return func() tea.Msg {
+		mgr := ledger.GetManager()
+		db, err := mgr.GetDB(projectPath)
+		if err != nil {
+			return decisionStatusMsg{action: "override", err: err}
+		}
+		// Use OverrideDecision with empty session and rationale (simplified for now)
+		if _, err := db.OverrideDecision(decisionID, "", "Overridden via Agent Deck"); err != nil {
+			return decisionStatusMsg{action: "override", err: err}
+		}
+		return decisionStatusMsg{action: "override"}
+	}
+}
+
+// reactivateDecision reactivates a decision to active status
+func (h *Home) reactivateDecision(decisionID string) tea.Cmd {
+	projectPath := h.getCurrentProjectPath()
+	return func() tea.Msg {
+		mgr := ledger.GetManager()
+		db, err := mgr.GetDB(projectPath)
+		if err != nil {
+			return decisionStatusMsg{action: "reactivate", err: err}
+		}
+		// Get the decision and update its status
+		decision, err := db.GetDecision(decisionID)
+		if err != nil || decision == nil {
+			return decisionStatusMsg{action: "reactivate", err: fmt.Errorf("decision not found")}
+		}
+		decision.Status = database.DecisionStatusActive
+		if err := db.UpdateDecision(decision); err != nil {
+			return decisionStatusMsg{action: "reactivate", err: err}
+		}
+		return decisionStatusMsg{action: "reactivate"}
+	}
+}
+
+// copyDecisionToClipboard copies the decision to clipboard in a format suitable for pasting into Claude sessions
+func (h *Home) copyDecisionToClipboard(d *database.Decision) tea.Cmd {
+	return func() tea.Msg {
+		// Format decision for clipboard - useful for pasting into Claude
+		var sb strings.Builder
+		sb.WriteString("**Decision: ")
+		sb.WriteString(d.Category)
+		sb.WriteString("**\n\n")
+		sb.WriteString(d.Decision)
+		if d.Rationale != "" {
+			sb.WriteString("\n\n**Rationale:** ")
+			sb.WriteString(d.Rationale)
+		}
+		sb.WriteString("\n\n_Status: ")
+		switch d.Status {
+		case database.DecisionStatusActive:
+			sb.WriteString("Active")
+		case database.DecisionStatusArchived:
+			sb.WriteString("Archived")
+		case database.DecisionStatusOverridden:
+			sb.WriteString("Overridden")
+		}
+		sb.WriteString("_")
+
+		if err := clipboard.WriteAll(sb.String()); err != nil {
+			return clipboardCopyMsg{success: false, err: err}
+		}
+		return clipboardCopyMsg{success: true}
+	}
+}
+
+// deleteDecision permanently deletes a decision
+func (h *Home) deleteDecision(decisionID string) tea.Cmd {
+	projectPath := h.getCurrentProjectPath()
+	return func() tea.Msg {
+		mgr := ledger.GetManager()
+		db, err := mgr.GetDB(projectPath)
+		if err != nil {
+			return decisionStatusMsg{action: "delete", err: err}
+		}
+		if err := db.DeleteDecision(decisionID); err != nil {
+			return decisionStatusMsg{action: "delete", err: err}
+		}
+		return decisionStatusMsg{action: "delete"}
+	}
+}
+
+// getProjectDecisions returns cached decisions for a project path
+// This is a synchronous call for the preview pane - uses cached data
+func (h *Home) getProjectDecisions(projectPath string) []*database.Decision {
+	if projectPath == "" {
+		return nil
+	}
+
+	// Check if we have decisions cached for the current project
+	if h.decisionPanel.GetProjectPath() == projectPath {
+		return h.decisionPanel.Decisions()
+	}
+
+	// Try to load synchronously (brief blocking for preview)
+	mgr := ledger.GetManager()
+	db, err := mgr.GetDB(projectPath)
+	if err != nil {
+		return nil
+	}
+
+	decisions, err := db.ListDecisions(database.DecisionFilter{})
+	if err != nil {
+		return nil
+	}
+
+	return decisions
 }
 
 // handleGroupDialogKey handles keys when group dialog is visible
@@ -2771,6 +3148,7 @@ func (h *Home) updateSizes() {
 	h.newDialog.SetSize(h.width, h.height)
 	h.groupDialog.SetSize(h.width, h.height)
 	h.confirmDialog.SetSize(h.width, h.height)
+	h.decisionDialog.SetSize(h.width, h.height)
 }
 
 // View renders the UI
@@ -2829,6 +3207,9 @@ func (h *Home) View() string {
 	}
 	if h.mcpDialog.IsVisible() {
 		return h.mcpDialog.View()
+	}
+	if h.decisionDialog.IsVisible() {
+		return h.decisionDialog.View()
 	}
 
 	// Reuse viewBuilder to reduce allocations (reset and pre-allocate)
@@ -2948,9 +3329,20 @@ func (h *Home) View() string {
 	panelTitleLines := 2
 	panelContentHeight := contentHeight - panelTitleLines
 
-	// Build left panel (session list) with styled title
-	leftTitle := h.renderPanelTitle("SESSIONS", leftWidth)
-	leftContent := h.renderSessionList(leftWidth, panelContentHeight)
+	// Build left panel based on view mode (sessions or decisions)
+	var leftTitle, leftContent string
+	if h.viewMode == ViewModeDecisions {
+		decisionCount := len(h.decisionPanel.Decisions())
+		titleText := "DECISIONS"
+		if decisionCount > 0 {
+			titleText = fmt.Sprintf("DECISIONS (%d)", decisionCount)
+		}
+		leftTitle = h.renderPanelTitle(titleText, leftWidth)
+		leftContent = h.decisionPanel.Render(leftWidth, panelContentHeight)
+	} else {
+		leftTitle = h.renderPanelTitle("SESSIONS", leftWidth)
+		leftContent = h.renderSessionList(leftWidth, panelContentHeight)
+	}
 	// CRITICAL: Ensure left content has exactly panelContentHeight lines
 	leftContent = ensureExactHeight(leftContent, panelContentHeight)
 	leftPanel := leftTitle + "\n" + leftContent
@@ -3926,6 +4318,24 @@ func (h *Home) renderForkingState(inst *session.Instance, width int, startTime t
 func (h *Home) renderPreviewPane(width, height int) string {
 	var b strings.Builder
 
+	// Handle decision view mode
+	if h.viewMode == ViewModeDecisions {
+		selected := h.decisionPanel.Selected()
+		sessionName := ""
+		if selected != nil && selected.SessionID != "" {
+			// Try to find the session name
+			h.instancesMu.RLock()
+			for _, inst := range h.instances {
+				if inst.ID == selected.SessionID {
+					sessionName = inst.Title
+					break
+				}
+			}
+			h.instancesMu.RUnlock()
+		}
+		return RenderDecisionPreview(selected, width, height, sessionName)
+	}
+
 	if len(h.flatItems) == 0 || h.cursor >= len(h.flatItems) {
 		// Show different message when there are no sessions vs just no selection
 		if len(h.flatItems) == 0 {
@@ -4190,6 +4600,63 @@ func (h *Home) renderPreviewPane(width, height int) string {
 			b.WriteString(hintStyle.Render(" fork with options"))
 			b.WriteString("\n")
 		}
+	}
+
+	// Ledger section - show relevant decisions for this project
+	if decisions := h.getProjectDecisions(selected.ProjectPath); len(decisions) > 0 {
+		ledgerHeader := renderSectionDivider("Ledger", width-4)
+		b.WriteString(ledgerHeader)
+		b.WriteString("\n")
+
+		labelStyle := lipgloss.NewStyle().Foreground(ColorText)
+		decisionStyle := lipgloss.NewStyle().Foreground(ColorPurple)
+		countStyle := lipgloss.NewStyle().Foreground(ColorAccent).Bold(true)
+
+		// Show count and first few decisions
+		activeCount := 0
+		for _, d := range decisions {
+			if d.Status == database.DecisionStatusActive {
+				activeCount++
+			}
+		}
+		b.WriteString(labelStyle.Render("Active:  "))
+		b.WriteString(countStyle.Render(fmt.Sprintf("%d decisions", activeCount)))
+		b.WriteString("\n")
+
+		// Show up to 3 most recent active decisions
+		shown := 0
+		for _, d := range decisions {
+			if d.Status != database.DecisionStatusActive {
+				continue
+			}
+			if shown >= 3 {
+				remainingStyle := lipgloss.NewStyle().Foreground(ColorComment).Italic(true)
+				b.WriteString(remainingStyle.Render(fmt.Sprintf("         +%d more (Shift+D to view all)", activeCount-3)))
+				b.WriteString("\n")
+				break
+			}
+			// Truncate decision text
+			decisionText := d.Decision
+			maxLen := width - 12
+			if maxLen < 20 {
+				maxLen = 20
+			}
+			if len(decisionText) > maxLen {
+				decisionText = decisionText[:maxLen-1] + "…"
+			}
+			b.WriteString(labelStyle.Render("  • "))
+			b.WriteString(decisionStyle.Render(decisionText))
+			b.WriteString("\n")
+			shown++
+		}
+
+		// Hint for adding new decisions
+		hintStyle := lipgloss.NewStyle().Foreground(ColorComment).Italic(true)
+		keyStyle := lipgloss.NewStyle().Foreground(ColorAccent).Bold(true)
+		b.WriteString(hintStyle.Render("         "))
+		b.WriteString(keyStyle.Render("Ctrl+D"))
+		b.WriteString(hintStyle.Render(" to log decision"))
+		b.WriteString("\n")
 	}
 	b.WriteString("\n")
 
